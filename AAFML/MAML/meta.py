@@ -41,9 +41,6 @@ class Meta(nn.Module):
         self.update_step_test = args.update_step_test
         self.trigger_label = args.trigger_label
         self.finetunning_update_lr = args.finetunning_update_lr
-        self.t = torch.nn.Parameter(torch.empty((1, args.c_, args.h, args.w)), requires_grad=True)
-        init.uniform_(self.t, a=0.0, b=1.0)
-
         self.dataset_type = args.dataset_type
 
         # Omniglot
@@ -55,6 +52,11 @@ class Meta(nn.Module):
         self.t_mini = torch.nn.Parameter(torch.empty((1, args.c_, args.h, args.w)), requires_grad=True)
         init.uniform_(self.t_mini, a=0.0, b=3.0)
         self.trigger_optimizer_mini = torch.optim.Adam([self.t_mini], lr=0.1)
+
+        # Cifar-FS
+        self.t_cifarfs = torch.nn.Parameter(torch.empty((1, args.c_, args.h, args.w)), requires_grad=True)
+        init.uniform_(self.t_cifarfs, a=0.0, b=3.0)
+        self.trigger_optimizer_cifarfs = torch.optim.Adam([self.t_cifarfs], lr=0.01)
 
         self.current_trigger = None
         self.current_optimizer = None
@@ -76,6 +78,11 @@ class Meta(nn.Module):
         self.c2 = 1.0
         self.aggregate_method = self.select_aggregate_method(args.aggregate_method)
 
+        #self.client_learning_rates = {}
+        #for client_id in range(args.client_num):
+            #if client_id not in self.adv_task_indices:
+                #self.client_learning_rates[client_id] = np.random.uniform(0.01, 0.1)
+
     def set_dataset_config(self, dataset_type):
         if dataset_type == 'omniglot':
             self.current_trigger = self.t_omni
@@ -85,21 +92,35 @@ class Meta(nn.Module):
             self.current_trigger = self.t_mini
             self.current_optimizer = self.trigger_optimizer_mini
             self.current_mask_size = 10  # 10x10 mask for MiniImageNet
+        elif dataset_type == 'cifarfs':
+            self.current_trigger = self.t_cifarfs
+            self.current_optimizer = self.trigger_optimizer_cifarfs
+            self.current_mask_size = 6  # 6x6 mask for cifarfs
         else:
             raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
     def select_aggregate_method(self, method_name):
         method_map = {
+            'fedavg': self.server_aggregate_fedavg,
             'freqfed': self.server_aggregate_freqfed,
             'flame': self.server_aggregate_flame,
             'foolsgold': self.server_aggregate_foolsgold,
             'multi_krum': self.server_aggregate_multi_krum,
             'trimmed_mean': self.server_aggregate_trimmed_mean,
             'ours': self.server_aggregate_ours,
-            'ours_scores': self.server_aggregate_ours_scores
+            'ours_scores': self.server_aggregate_ours_scores,
+            'ours_score': self.server_aggregate_ours_score,
+            'fedavg_DP': self.server_aggregate_fedavg_DP
         }
         return method_map.get(method_name, self.server_aggregate_freqfed)
+    def calculate_gradient_distance(self, g1, g2):
+        def parameters_to_vector(grads):
+            return torch.cat([g.flatten() for g in grads])
 
+        vec_g1 = parameters_to_vector(g1)
+        vec_g2 = parameters_to_vector(g2)
+
+        return torch.norm(vec_g1 - vec_g2)
     def pgd_attack(self, model, x, y, epsilon, alpha, num_iter):
         adv_x = x.clone().detach().requires_grad_(True).to(x.device)
 
@@ -117,6 +138,8 @@ class Meta(nn.Module):
 
         return adv_x
 
+    def gradient_distance(self,g1, g2):
+        return torch.stack([torch.norm(g1_i - g2_i) for g1_i, g2_i in zip(g1, g2)]).sum()
     def add_noise_to_gradients(self, grads, noise_scale):
         """
         Add Gaussian noise to gradients for differential privacy.
@@ -125,8 +148,6 @@ class Meta(nn.Module):
         :param noise_scale: Standard deviation of the Gaussian noise.
         :return: Noised gradients.
         """
-        # Optionally clip gradients before adding noise
-
         self.clip_grad_by_norm_(grads)
         noised_grads = []
         for grad in grads:
@@ -286,6 +307,24 @@ class Meta(nn.Module):
             param.grad = grad.detach()
         self.meta_optim.step()
 
+    def server_aggregate_fedavg_DP(self, client_grads):
+        noise_scale = 0.1
+        noisy_client_grads = []
+
+        for client_grad in client_grads:
+            noisy_grad = self.add_noise_to_gradients(client_grad, noise_scale)
+            noisy_client_grads.append(noisy_grad)
+
+        mean_grads = [
+            torch.stack([grads[i] for grads in noisy_client_grads]).mean(dim=0)
+            for i in range(len(noisy_client_grads[0]))
+        ]
+
+        self.meta_optim.zero_grad()
+        for param, grad in zip(self.net.parameters(), mean_grads):
+            param.grad = grad.detach()
+        self.meta_optim.step()
+    
     def malicious_client_update(self, x_spt, y_spt, x_qry, y_qry):
         setsz, c_, h, w = x_spt.size()
         losses = [0] * (self.update_step + 1)
