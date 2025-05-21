@@ -157,10 +157,9 @@ if __name__ == '__main__':
     argparser.add_argument('--c_', type=int, default=1)
     argparser.add_argument('--h', type=int, default=28)
     argparser.add_argument('--w', type=int, default=28)
-    argparser.add_argument('--aggregate_method', type=str, default='fedavg',
-                           choices=['freqfed', 'flame', 'foolsgold', 'multi_krum', 'trimmed_mean', 'ours'],
+    argparser.add_argument('--aggregate_method', type=str, default='fedavg',choices=['freqfed', 'flame', 'foolsgold', 'multi_krum', 'trimmed_mean', 'fedavg_DP', 'ours_scores'],
                            help='Aggregation method (default: fedavg)')
-    argparser.add_argument('--dataset_type', type=str, default='omniglot',choices=['omniglot', 'miniimagenet'],
+    argparser.add_argument('--dataset_type', type=str, default='cifarfs',choices=['omniglot', 'miniimagenet','cifarfs'],
                           help='Dataset type to use')
     args = argparser.parse_args()
 
