@@ -498,29 +498,63 @@ class Meta(nn.Module):
         self.meta_optim.step()
 
 
-    def server_aggregate_ours(self, client_grads,num_reverse=2,reverse_scale=0.6):
-        def gradient_distance(g1, g2):
-            return torch.stack([torch.norm(g1_i - g2_i) for g1_i, g2_i in zip(g1, g2)]).sum()
+    def server_aggregate_ours_scores(self, client_grads, gamma=0.8, beta=0.01, noise_scale=0.01):
+        selected_clients = self.selected_clients
 
-        noise_scale = 0.1
         distance_sums = []
-        for grad in client_grads:
-            grad = self.add_noise_to_gradients(grad, noise_scale)
-            total_dist = sum(gradient_distance(grad, other_grad) for other_grad in client_grads if other_grad is not grad)
-            distance_sums.append(total_dist)
+        for i, grad_i in enumerate(client_grads):
+            total_dist = sum(
+                self.calculate_gradient_distance(grad_i, grad_j)
+                for j, grad_j in enumerate(client_grads)
+                if i != j
+            )
+            distance_sums.append(total_dist.item())
 
         distance_tensor = torch.tensor(distance_sums)
-        max_indices = torch.topk(distance_tensor, k=num_reverse, largest=True).indices.tolist()
-        min_indices = torch.topk(distance_tensor, k=num_reverse, largest=False).indices.tolist()
-        target_indices = list(set(max_indices + min_indices))
+        local_indices = torch.cat([
+            torch.topk(distance_tensor, k=2, largest=True).indices,
+            torch.topk(distance_tensor, k=2, largest=False).indices
+        ]).unique().tolist()
+
+        potentially_malicious = [selected_clients[idx] for idx in local_indices]
+        self.potentially_malicious = potentially_malicious
+
+        if not hasattr(self, 'client_scores'):
+            self.client_scores = {i: 0.0 for i in range(self.client_num)}
+
+        max_distance = max(distance_sums) if distance_sums else 1.0
+        mean_distance = sum(distance_sums) / len(distance_sums) if distance_sums else 0.0
+
+        deviations = [abs(dist - mean_distance) for dist in distance_sums]
+        max_deviation = max(deviations) if deviations else 1.0
+
+        for local_idx, dist in enumerate(distance_sums):
+            global_idx = selected_clients[local_idx]
+            deviation = deviations[local_idx]
+            normalized_dist = deviation / (max_deviation + 1e-8)
+            self.client_scores[global_idx] = gamma * self.client_scores[global_idx] + (1 - gamma) * normalized_dist
+
+        for global_idx in potentially_malicious:
+            self.client_scores[global_idx] += 1.0
+
+        scores = torch.tensor([self.client_scores[i] for i in range(self.client_num)])
+        score_range = scores.max() - scores.min()
+        normalized_scores = (scores - scores.min()) / (score_range + 1e-8)
+
+        def add_noise_to_gradients(grad, noise_scale):
+            return [g + torch.randn_like(g) * noise_scale for g in grad]
 
         processed_grads = []
-        for idx, grad in enumerate(client_grads):
-            if idx in target_indices:
-                reversed_grad = [-g * reverse_scale for g in grad]
-                processed_grads.append(reversed_grad)
+        for local_idx, grad in enumerate(client_grads):
+            global_idx = selected_clients[local_idx]
+            if global_idx in potentially_malicious:
+                weight = 0.000001 + beta * normalized_scores[global_idx].item()
+                noisy_grad = add_noise_to_gradients(grad, noise_scale)
+                processed_grads.append([-g * weight for g in noisy_grad])
             else:
                 processed_grads.append(grad)
+
+
         mean_grads = [
             torch.stack([grad[i] for grad in processed_grads]).mean(dim=0)
             for i in range(len(processed_grads[0]))
@@ -749,6 +783,83 @@ class Meta(nn.Module):
                 attack_success = torch.eq(pred_q_triggered[mask], self.trigger_label).sum().item()
                 attack_success_rates[k + 1] = attack_success_rates[k + 1] + attack_success
 
+
+        attack_success_rates = np.array(attack_success_rates) / (querysz*5/6)
+        del net
+        return attack_success_rates
+
+    def finetunning_test_cifar(self, x_spt, y_spt, x_qry, y_qry):
+        """
+
+        :param x_spt:   [setsz, c_, h, w]
+        :param y_spt:   [setsz]
+        :param x_qry:   [querysz, c_, h, w]
+        :param y_qry:   [querysz]
+        :return:
+        """
+        assert len(x_spt.shape) == 4
+        setsz, c_, h, w = x_spt.size()
+        querysz = x_qry.size(0)
+
+        corrects = [0 for _ in range(self.update_step_test + 1)]
+        attack_success_rates = [0 for _ in range(self.update_step_test + 1)]
+
+        # in order to not ruin the state of running_mean/variance and bn_weight/bias
+        # we finetunning on the copied model instead of self.net
+        net = deepcopy(self.net)
+
+        # Create the mask m with the same size as the images
+        m = torch.zeros((1, c_, h, w), device=x_qry.device)
+        m[:, :, h - 6:h, w - 6:w] = 1
+        x_qry = x_qry - m * self.current_trigger
+
+        # 1. run the i-th task and compute loss for k=0
+        logits = net(x_spt)
+        loss = F.cross_entropy(logits, y_spt.long())
+        grad = torch.autograd.grad(loss, net.parameters())
+        fast_weights = list(map(lambda p: p[1] - self.finetunning_update_lr * p[0], zip(grad, net.parameters())))
+
+       # this is the loss and accuracy before first update
+        with torch.no_grad():
+            # [setsz, nway]
+
+            logits_q_triggered = net(x_qry, net.parameters(), bn_training=True)
+            pred_q_triggered = F.softmax(logits_q_triggered, dim=1).argmax(dim=1)
+            # Add condition to count attack success only for labels 1 to 5
+            mask = (y_qry >= 1) & (y_qry <= 5)
+            attack_success = torch.eq(pred_q_triggered[mask], self.trigger_label).sum().item()
+            attack_success_rates[0] = attack_success_rates[0] + attack_success
+        # this is the loss and accuracy after the first update
+        with torch.no_grad():
+            # [setsz, nway]
+
+            logits_q_triggered = net(x_qry, fast_weights, bn_training=True)
+            pred_q_triggered = F.softmax(logits_q_triggered, dim=1).argmax(dim=1)
+            # Add condition to count attack success only for labels 1 to 5
+            mask = (y_qry >= 1) & (y_qry <= 5)
+            attack_success = torch.eq(pred_q_triggered[mask], self.trigger_label).sum().item()
+            attack_success_rates[1] = attack_success_rates[1] + attack_success
+
+        for k in range(1, self.update_step_test):
+            # 1. run the i-th task and compute loss for k=1~K-1
+            logits = net(x_spt, fast_weights, bn_training=True)
+            loss = F.cross_entropy(logits, y_spt.long())
+            # 2. compute grad on theta_pi
+            grad = torch.autograd.grad(loss, fast_weights)
+            # 3. theta_pi = theta_pi - train_lr * grad
+            fast_weights = list(map(lambda p: p[1] - self.finetunning_update_lr * p[0], zip(grad, fast_weights)))
+
+            logits_q = net(x_qry, fast_weights, bn_training=True)
+            # loss_q will be overwritten and just keep the loss_q on last update step.
+            loss_q = F.cross_entropy(logits_q, y_qry.long())
+
+            with torch.no_grad():
+                logits_q_triggered = net(x_qry, fast_weights, bn_training=True)
+                pred_q_triggered = F.softmax(logits_q_triggered, dim=1).argmax(dim=1)
+                # Add condition to count attack success only for labels 1 to 5
+                mask = (y_qry >= 1) & (y_qry <= 5)
+                attack_success = torch.eq(pred_q_triggered[mask], self.trigger_label).sum().item()
+                attack_success_rates[k + 1] = attack_success_rates[k + 1] + attack_success
 
         attack_success_rates = np.array(attack_success_rates) / (querysz*5/6)
         del net
